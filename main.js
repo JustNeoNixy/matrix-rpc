@@ -1,11 +1,21 @@
 import "dotenv/config";
 import Server from "arrpc/src/server.js";
 import fs from "fs/promises";
+import { spawn } from "child_process";
+import readline from "readline";
 
 let activitiesCache = null;
 let activityNamesCache = [];
 let getAppInfoQueue = [];
 let refreshTimeout;
+
+// Sable status state
+const SABLE_STATUS_FIELD = "org.matrix.msc4426.status";
+let sableStatusCache = null;
+let gameText = "";
+let musicText = "";
+let playerProc = null;
+let shuttingDown = false;
 
 const appCache = await loadOrCreateAppCache();
 const activities = new Map();
@@ -21,6 +31,13 @@ arrpc.on("activity", async (data) => {
     }
 
     console.log(`Ongoing activities: ${activities.size}`);
+
+    // Sable status goes first because the blocks below can return early
+    if (process.env.USE_SABLE_STATUS === "true") {
+        gameText = await buildGameText(activities);
+        await updateSable();
+    }
+
     if (process.env.USE_PROFILE_FIELD === "true") {
         const parsedActivities = await parseActivities(activities);
         if (!parsedActivities) return;
@@ -37,7 +54,12 @@ arrpc.on("activity", async (data) => {
 
 async function cleanup() {
     console.log("\nExiting cleanly");
+    shuttingDown = true;
+    if (playerProc) playerProc.kill();
 
+    if (process.env.USE_SABLE_STATUS === "true") {
+        await setSableStatus("");
+    }
     if (process.env.USE_PROFILE_FIELD === "true") {
         await setMatrixRPC([]);
     }
@@ -49,6 +71,66 @@ async function cleanup() {
 
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
+
+// ---------- Sable status ----------
+
+async function buildGameText(activities) {
+    const parts = [];
+    for (const a of activities.values()) {
+        if (a.type !== 0) continue;
+        const name = a.name ?? (await getAppInfo(a.application_id))?.name;
+        if (name) parts.push(`Playing ${name}`);
+    }
+    return parts.join(" | ");
+}
+
+async function updateSable() {
+    await setSableStatus([gameText, musicText].filter(Boolean).join(" | "));
+}
+
+async function setSableStatus(text) {
+    if (text === sableStatusCache) return;
+    sableStatusCache = text;
+
+    const url = `${process.env.SERVER_URL}/_matrix/client/v3/profile/${encodeURIComponent(process.env.MATRIX_USER_ID)}/${SABLE_STATUS_FIELD}`;
+    try {
+        const res = await fetch(url, {
+            method: text ? "PUT" : "DELETE",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.TOKEN}`,
+            },
+            body: text ? JSON.stringify({ [SABLE_STATUS_FIELD]: { emoji: "", text } }) : undefined,
+        });
+        console.log("sable status:", text || "(cleared)", res.status);
+        if (!res.ok) {
+            console.warn(await res.text());
+            sableStatusCache = null; // retry on the next change
+        }
+    } catch (err) {
+        console.warn(err);
+        sableStatusCache = null;
+    }
+}
+
+function watchPlayerctl() {
+    playerProc = spawn("playerctl", ["--follow", "metadata", "--format", "{{status}}\t{{artist}}\t{{title}}"]);
+    playerProc.on("error", (err) => console.warn("playerctl:", err.message));
+    playerProc.on("exit", () => {
+        if (!shuttingDown) setTimeout(watchPlayerctl, 5000);
+    });
+
+    const rl = readline.createInterface({ input: playerProc.stdout });
+    rl.on("line", async (line) => {
+        const [status, artist, title] = line.split("\t");
+        musicText = status === "Playing" && title ? `Listening to ${title}${artist ? " - " + artist : ""}` : "";
+        await updateSable();
+    });
+}
+
+if (process.env.USE_SABLE_STATUS === "true") watchPlayerctl();
+
+// ---------- Original Matrix RPC / presence code ----------
 
 async function parseActivities(activities) {
     const results = [];
@@ -175,6 +257,7 @@ async function setMatrixStatus(activities) {
     const res = await fetch(url, {
         method: "PUT",
         headers: {
+            "Content-Type": "application/json",
             Authorization: `Bearer ${process.env.TOKEN}`,
         },
         body: JSON.stringify({
