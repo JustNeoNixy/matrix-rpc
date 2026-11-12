@@ -1,12 +1,12 @@
 {
-    "name": "discord-rpc-to-matrix-rpc",
+    "name": "matrix-rpc",
     "version": "0.0.1",
     "description": "",
     "main": "main.js",
     "scripts": {
         "start": "node main.js"
     },
-    "author": "GabiZar",
+    "author": "JustNeoNixie",
     "license": "GPL-3.0",
     "dependencies": {
         "arrpc": "github:Vencord/arrpc",
